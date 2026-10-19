@@ -314,4 +314,209 @@ This pipeline enables any Git commit to automatically propagate to the Kubernete
 
 ---
 
-make .md file
+# Using a Private Local Image Repository with Kubernetes Deployment
+
+This guide explains how to configure a Kubernetes Deployment to pull an image from a **private local repository** (e.g., GitLab Container Registry) using **username/password authentication**.
+
+---
+
+## Table of Contents
+
+1. [Overview](#1-overview)
+2. [Step 1 — Create the Image Pull Secret](#2-step-1--create-the-image-pull-secret)
+3. [Step 2 — Modify the Deployment Manifest](#3-step-2--modify-the-deployment-manifest)
+4. [Step 3 — Apply the Update](#4-step-3--apply-the-update)
+5. [Step 4 — Verify the Pull](#5-step-4--verify-the-pull)
+6. [Troubleshooting](#6-troubleshooting)
+7. [Key Points](#7-key-points)
+
+---
+
+## 1. Overview
+
+Kubernetes needs credentials to pull images from a private registry. The standard approach is:
+
+1. Create a **`docker-registry` Secret** containing the registry URL, username, and password/token.
+2. Reference that Secret in the Deployment via **`imagePullSecrets`**.
+3. Point the `image` field to the **fully qualified private registry path**.
+
+---
+
+## 2. Step 1 — Create the Image Pull Secret
+
+Run the following command on a machine with `kubectl` access to your cluster. Replace the placeholder values with your actual registry details.
+
+```bash
+kubectl create secret docker-registry gitlab-regcred \
+  --docker-server=registry.example.com \
+  --docker-username=<your-username> \
+  --docker-password=<your-password-or-token> \
+  --docker-email=unused@example.com
+```
+
+### Parameter explanation
+
+| Flag | Description |
+|------|-------------|
+| `--docker-server` | Private registry address, e.g. `registry.gitlab.com` or your GitLab domain `registry.example.com` |
+| `--docker-username` | GitLab username |
+| `--docker-password` | GitLab password **or** Personal Access Token (recommended: token with `read_registry` scope) |
+| `--docker-email` | Any value; required by the command but not used by modern registries |
+
+### Expected output
+
+```
+secret/gitlab-regcred created
+```
+
+### If the Secret already exists
+
+Delete and recreate it:
+
+```bash
+kubectl delete secret gitlab-regcred
+kubectl create secret docker-registry gitlab-regcred \
+  --docker-server=registry.example.com \
+  --docker-username=<your-username> \
+  --docker-password=<your-password-or-token> \
+  --docker-email=unused@example.com
+```
+
+### Create the Secret in a specific namespace
+
+```bash
+kubectl create secret docker-registry gitlab-regcred \
+  --docker-server=registry.example.com \
+  --docker-username=<your-username> \
+  --docker-password=<your-password-or-token> \
+  --docker-email=unused@example.com \
+  -n <namespace>
+```
+
+---
+
+## 3. Step 2 — Modify the Deployment Manifest
+
+Add `imagePullSecrets` under `spec.template.spec`, and update the `image` field to point to the private registry.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-demo
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      imagePullSecrets:
+      - name: gitlab-regcred
+      containers:
+      - name: nginx
+        image: registry.example.com/your-namespace/nginx:1.25
+        ports:
+        - containerPort: 80
+```
+
+### What changed
+
+| Field | Original | Updated |
+|-------|----------|---------|
+| `spec.template.spec.imagePullSecrets` | *(not present)* | `- name: gitlab-regcred` |
+| `spec.template.spec.containers[0].image` | `nginx:1.25` | `registry.example.com/your-namespace/nginx:1.25` |
+
+> **Important:** The `image` field must be the **fully qualified path** of your private repository (including the registry domain, project path, and tag). Otherwise, Kubernetes will still try to pull from Docker Hub.
+
+---
+
+## 4. Step 3 — Apply the Update
+
+### Option A — Apply directly with kubectl
+
+```bash
+kubectl apply -f deployment.yaml
+```
+
+### Option B — Deploy via Argo CD (GitOps)
+
+If this Deployment is already managed by Argo CD:
+
+1. Commit and push the updated YAML to your GitLab repository.
+2. Argo CD will auto-sync (if `Automated` sync policy is enabled) or you can manually click **SYNC** in the Argo CD UI.
+
+```bash
+git add deployment.yaml
+git commit -m "Use private registry with imagePullSecrets"
+git push origin main
+```
+
+---
+
+## 5. Step 4 — Verify the Pull
+
+### Check pod status
+
+```bash
+kubectl get pods
+```
+
+Pods should show `Running`. If you see `ImagePullBackOff` or `ErrImagePull`, proceed to the troubleshooting section.
+
+### Inspect events for pull errors
+
+```bash
+kubectl describe pod <pod-name>
+```
+
+Look at the **Events** section at the bottom for messages about authentication failures.
+
+### Verify the secret was created correctly
+
+```bash
+kubectl get secret gitlab-regcred -o yaml
+```
+
+The `.dockerconfigjson` field should be a base64-encoded JSON containing your registry credentials.
+
+---
+
+## 6. Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `ImagePullBackOff` | Wrong credentials, wrong registry URL, or missing secret | Recreate the secret; verify `--docker-server` matches the image prefix |
+| `ErrImagePull` | Image path/tag is wrong | Check the full image path and tag exist in the registry |
+| `401 Unauthorized` | Password invalid, or 2FA enabled (password not accepted) | Use a **Personal Access Token** instead of a password |
+| `403 Forbidden` | Token lacks `read_registry` scope | Regenerate token with `read_registry` scope |
+| `secret "gitlab-regcred" not found` | Secret not in the same namespace as the Deployment | Create the secret in the correct namespace |
+| Pull works locally but not in cluster | Cluster nodes can't reach the registry | Ensure DNS + network reachability from nodes to the registry |
+
+### Test registry login from a node
+
+```bash
+docker login registry.example.com -u <username> -p <password-or-token>
+```
+
+If this fails on a node, the Kubernetes pull will also fail — fix DNS, firewall, or TLS first.
+
+---
+
+## 7. Key Points
+
+- **Namespace scope:** The Secret must live in the **same namespace** as the Deployment. Add `-n <namespace>` to the `kubectl create secret` command if needed.
+- **2FA accounts:** If GitLab has two-factor authentication enabled, plain passwords are rejected. Use a **Personal Access Token** with `read_registry` scope.
+- **Image path:** Change `image:` to the full private registry path (domain + project + tag). Bare names like `nginx:1.25` will still pull from Docker Hub.
+- **For multiple namespaces:** Either recreate the Secret per namespace or use a tool like `kubectl-neat` / a Helm chart that templatizes the Secret.
+- **For production:** Prefer a **dedicated deploy token** with read-only registry access instead of a personal account.
+- **GitOps note:** When using Argo CD, secrets should ideally be managed via **Sealed Secrets**, **External Secrets Operator**, or **Vault** rather than committed as plain YAML.
+
+---
+
+**End of Document**
